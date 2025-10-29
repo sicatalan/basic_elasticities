@@ -280,6 +280,80 @@ def zone_summary_for_sku(df: pd.DataFrame, sku: str, start: pd.Timestamp, end: p
     return out.sort_values("kilos", ascending=False)
 
 
+def points_by_week_all(df: pd.DataFrame, start: pd.Timestamp, end: pd.Timestamp) -> pd.DataFrame:
+    d = df.copy()
+    if "semana" not in d.columns:
+        return pd.DataFrame()
+    try:
+        d["semana"] = pd.to_datetime(d["semana"], errors="coerce")
+    except Exception:
+        pass
+    d = d[d["semana"].between(start, end)]
+    if d.empty or "sku" not in d.columns:
+        return pd.DataFrame()
+    d["_kilos"] = pd.to_numeric(d.get("kilos"), errors="coerce")
+    if "venta" in d.columns:
+        d["_venta"] = pd.to_numeric(d.get("venta"), errors="coerce")
+    if "costo" in d.columns:
+        d["_costo"] = pd.to_numeric(d.get("costo"), errors="coerce")
+    if "precio_promedio" in d.columns:
+        d["_precio"] = pd.to_numeric(d.get("precio_promedio"), errors="coerce")
+        d["_pxq"] = d["_precio"] * d["_kilos"]
+    grp = d.groupby(["sku", "semana"], as_index=False)
+    out = grp["_kilos"].sum().rename(columns={"_kilos": "kilos"})
+    if "_venta" in d.columns:
+        out = out.merge(grp["_venta"].sum().rename(columns={"_venta": "venta"}), on=["sku", "semana"], how="left")
+    if "_costo" in d.columns:
+        out = out.merge(grp["_costo"].sum().rename(columns={"_costo": "costo"}), on=["sku", "semana"], how="left")
+    if "_pxq" in d.columns:
+        out = out.merge(grp["_pxq"].sum().rename(columns={"_pxq": "_pxq"}), on=["sku", "semana"], how="left")
+    # precio por kilo: venta/kilos; si no hay venta, ponderado por precio
+    if "venta" in out.columns:
+        out["precio_promedio"] = np.where(out["kilos"] > 0, out["venta"] / out["kilos"], np.nan)
+    elif "_pxq" in out.columns:
+        out["precio_promedio"] = np.where(out["kilos"] > 0, out["_pxq"] / out["kilos"], np.nan)
+    if "costo" in out.columns:
+        out["costo_por_kilo"] = np.where(out["kilos"] > 0, out["costo"] / out["kilos"], np.nan)
+    out = _ensure_logs(out)
+    return out.sort_values(["sku", "semana"])
+
+
+def compute_range_summary(df: pd.DataFrame, start: pd.Timestamp, end: pd.Timestamp) -> pd.DataFrame:
+    pts = points_by_week_all(df, start, end)
+    if pts.empty:
+        return pd.DataFrame(columns=["sku", "kilos", "venta", "costo", "precio_kilo", "costo_kilo", "contrib_kilo", "contrib_total", "alpha", "beta", "r2", "n_puntos"])  
+    # ajuste por SKU
+    def fit_group(g: pd.DataFrame) -> pd.Series:
+        datos = g[["ln_precio_promedio", "ln_kilos"]].replace([np.inf, -np.inf], np.nan).dropna()
+        n = int(datos.shape[0])
+        if n < 2:
+            return pd.Series({"alpha": np.nan, "beta": np.nan, "r2": np.nan, "n_puntos": n})
+        x = datos["ln_precio_promedio"].to_numpy(float)
+        y = datos["ln_kilos"].to_numpy(float)
+        if float(np.var(x)) == 0.0:
+            return pd.Series({"alpha": np.nan, "beta": np.nan, "r2": np.nan, "n_puntos": n})
+        beta, alpha = np.polyfit(x, y, 1)
+        r = np.corrcoef(x, y)[0, 1]
+        return pd.Series({"alpha": float(alpha), "beta": float(beta), "r2": float(r ** 2), "n_puntos": n})
+
+    fits = pts.groupby("sku", as_index=False).apply(fit_group).reset_index(drop=True)
+    sums = pts.groupby("sku", as_index=False).agg({"kilos": "sum", **({"venta": "sum"} if "venta" in pts.columns else {}), **({"costo": "sum"} if "costo" in pts.columns else {})})
+    out = sums.merge(fits, on="sku", how="left")
+    if "venta" in out.columns:
+        out["precio_kilo"] = np.where(out["kilos"] > 0, out["venta"] / out["kilos"], np.nan)
+    if "costo" in out.columns:
+        out["costo_kilo"] = np.where(out["kilos"] > 0, out["costo"] / out["kilos"], np.nan)
+    if "precio_kilo" in out.columns and "costo_kilo" in out.columns:
+        out["contrib_kilo"] = out["precio_kilo"] - out["costo_kilo"]
+    if "venta" in out.columns and "costo" in out.columns:
+        out["contrib_total"] = out["venta"] - out["costo"]
+    if "nombre_producto" in df.columns:
+        out = out.merge(df[["sku", "nombre_producto"]].drop_duplicates("sku"), on="sku", how="left")
+    cols = ["sku"] + (["nombre_producto"] if "nombre_producto" in out.columns else []) + ["kilos", "venta", "costo", "precio_kilo", "costo_kilo", "contrib_kilo", "contrib_total", "n_puntos", "beta", "alpha", "r2"]
+    out = out[[c for c in cols if c in out.columns]]
+    return out
+
+
 # ----------------------------
 # Load data
 # ----------------------------
@@ -316,7 +390,7 @@ except Exception:
 # ----------------------------
 # Tabs
 # ----------------------------
-tab_curvas, tab_precio = st.tabs(["Curvas por SKU", "Precio objetivo y tablas"])
+tab_curvas, tab_precio, tab_alertas = st.tabs(["Curvas por SKU", "Precio objetivo y tablas", "Alertas de SKUs"])
 
 
 # ----------------------------
@@ -647,3 +721,119 @@ with st.sidebar:
             st.success(f"Exportado a '{ELAS_FILE}'")
         except Exception as e:
             st.error(f"No se pudo exportar: {e}")
+
+
+# ----------------------------
+# Tab: Alertas de SKUs (pendiente positiva, relevancia)
+# ----------------------------
+with tab_alertas:
+    st.subheader("SKUs con pendiente positiva y relevancia")
+    # Rango de fechas
+    try:
+        all_dates = pd.to_datetime(df["semana"], errors="coerce") if "semana" in df.columns else pd.Series([], dtype="datetime64[ns]")
+        max_date = pd.to_datetime(all_dates.max()) if not all_dates.empty else pd.Timestamp.today()
+    except Exception:
+        max_date = pd.Timestamp.today()
+    default_start = max_date - pd.Timedelta(days=60)
+    start_end3 = st.date_input("Rango de fechas", (default_start.date(), max_date.date()), key="range_alertas")
+    if isinstance(start_end3, tuple) and len(start_end3) == 2:
+        start3 = pd.to_datetime(start_end3[0])
+        end3 = pd.to_datetime(start_end3[1])
+    else:
+        start3 = default_start
+        end3 = max_date
+
+    colA, colB, colC = st.columns([1,1,1])
+    with colA:
+        top_n = st.number_input("Top N por venta", min_value=10, max_value=1000, value=100, step=10)
+    with colB:
+        min_pts = st.number_input("Min. puntos (semanas)", min_value=1, max_value=50, value=3, step=1)
+    with colC:
+        only_pos = st.checkbox("Solo pendiente positiva (beta > 0)", value=True)
+
+    # Calcular y persistir al presionar Analizar
+    if st.button("Analizar", key="btn_alertas"):
+        with st.spinner("Calculando relevancia y pendientes..."):
+            st.session_state["alert_summary_base"] = compute_range_summary(df, start3, end3)
+            st.session_state["alert_range"] = (start3, end3)
+
+    # Usar resumen persistido si existe
+    base_summary = st.session_state.get("alert_summary_base", pd.DataFrame())
+    if base_summary.empty:
+        st.info("Presiona 'Analizar' para calcular el periodo.")
+    else:
+        summary = base_summary.copy()
+        # Filtros de UI (no mutan el almacenado)
+        if only_pos and "beta" in summary.columns:
+            summary = summary[summary["beta"] > 0]
+        if "n_puntos" in summary.columns:
+            summary = summary[summary["n_puntos"] >= int(min_pts)]
+        if "venta" in summary.columns:
+            summary = summary.sort_values("venta", ascending=False)
+        if summary.shape[0] > int(top_n):
+            summary = summary.head(int(top_n))
+
+        total_skus = int(summary.shape[0])
+        pos_count = int((summary["beta"] > 0).sum()) if "beta" in summary.columns else 0
+        c1, c2 = st.columns(2)
+        c1.metric("SKUs en alerta", total_skus)
+        c2.metric("Con pendiente positiva", pos_count)
+
+        money_cols_sum = [c for c in ["venta","costo","precio_kilo","costo_kilo","contrib_kilo","contrib_total"] if c in summary.columns]
+        number_cols_sum = [c for c in ["kilos","n_puntos","r2","beta","alpha"] if c in summary.columns]
+        st.dataframe(style_table(summary.reset_index(drop=True), money_cols_sum, number_cols_sum), use_container_width=True)
+
+        # Selector para ver curva del SKU del listado usando el rango almacenado
+        if not summary.empty:
+            labels3 = []
+            if "nombre_producto" in summary.columns:
+                for _, r in summary.iterrows():
+                    labels3.append(f"{str(r['sku'])} - {str(r['nombre_producto'])}")
+            else:
+                labels3 = [str(s) for s in summary["sku"].astype(str).tolist()]
+            sel3 = st.selectbox("Ver curva del SKU", options=labels3, key="sel_alert")
+            sku3 = sel3.split(" - ",1)[0] if sel3 else None
+            if st.button("Generar curva del periodo", key="btn_alert_curve") and sku3:
+                # Usar el último rango analizado
+                r = st.session_state.get("alert_range", (start3, end3))
+                start_used, end_used = r
+                with st.spinner("Generando gráfica del periodo..."):
+                    pts_all = points_by_week_all(df, start_used, end_used)
+                    d_pts3 = pts_all[pts_all["sku"].astype(str) == str(sku3)].copy()
+                    a3, b3, r23, n3 = fit_from_points(d_pts3)
+                    datos3 = d_pts3[["ln_precio_promedio","ln_kilos"]].replace([np.inf,-np.inf], np.nan).dropna()
+                    cA, cB, cC, cD = st.columns(4)
+                    cA.metric("Puntos", int(n3))
+                    cB.metric("Alpha", f"{a3:.3f}" if not np.isnan(a3) else "-")
+                    cC.metric("Beta", f"{b3:.3f}" if not np.isnan(b3) else "-")
+                    cD.metric("R2", f"{r23:.3f}" if not np.isnan(r23) else "-")
+                    fig4, ax4 = plt.subplots(figsize=(6.5,4.5))
+                    if not datos3.empty:
+                        x = datos3["ln_precio_promedio"].to_numpy(); y = datos3["ln_kilos"].to_numpy()
+                        ax4.scatter(x,y,alpha=0.75,label="Datos (ln P vs ln Q)")
+                        if x.size>0 and not(np.isnan(a3) or np.isnan(b3)):
+                            xx = np.linspace(np.nanmin(x), np.nanmax(x), 100); yy = a3 + b3*xx
+                            ax4.plot(xx,yy,color='red',label=f"y = {a3:.2f} + {b3:.2f} x")
+                    ax4.set_xlabel("ln(P) precio"); ax4.set_ylabel("ln(Q) kilos"); ax4.grid(True, alpha=0.25); ax4.legend()
+                    st.pyplot(fig4, clear_figure=True, use_container_width=False)
+
+                    # Tabla de detalle semanal del periodo
+                    try:
+                        section_header("Detalle semanal del periodo")
+                        week_cols = [c for c in ["semana","kilos","venta","costo","precio_promedio","costo_por_kilo"] if c in d_pts3.columns]
+                        d_week = d_pts3[week_cols].copy()
+                        # Aliases amigables
+                        if "precio_promedio" in d_week.columns and "precio_por_kilo" not in d_week.columns:
+                            d_week.rename(columns={"precio_promedio":"precio_por_kilo"}, inplace=True)
+                        # Orden por fecha
+                        if "semana" in d_week.columns:
+                            try:
+                                d_week["semana"] = pd.to_datetime(d_week["semana"], errors="coerce")
+                            except Exception:
+                                pass
+                            d_week = d_week.sort_values("semana")
+                        money_cols_week = [c for c in ["precio_por_kilo","venta","costo","costo_por_kilo"] if c in d_week.columns]
+                        number_cols_week = [c for c in ["kilos"] if c in d_week.columns]
+                        st.dataframe(style_table(d_week.reset_index(drop=True), money_cols_week, number_cols_week), use_container_width=True)
+                    except Exception:
+                        pass

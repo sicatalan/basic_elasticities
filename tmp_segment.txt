@@ -1,0 +1,41 @@
+        sku2 = None
+    else:
+        st.caption(f"SKUs disponibles: {len(labels2):,}")
+        q2 = st.text_input("Buscar (SKU o nombre)", value="", key="q2")
+        sel_label2 = st.selectbox("SKU", options=labels2, index=0, key="sku_tab2")
+        sku2 = parse_sku_from_label(q2, labels2, skus2) if q2 else parse_sku_from_label(sel_label2, labels2, skus2)
+
+    col_left, col_right = st.columns([1, 1])
+
+    with col_left:
+        vol = st.number_input("Volumen objetivo Q (kilos)", min_value=0.0, value=10.0, step=1.0)
+        calc_btn = st.button("Calcular", key="btn_calc", disabled=not bool(sku2) or vol is None or vol <= 0)
+        if calc_btn and sku2 and vol and vol > 0:
+            st.session_state["calc_do"] = True
+            st.session_state["calc_sku"] = sku2
+            st.session_state["calc_vol"] = float(vol)
+
+    # Panel de resultados controlado por botón
+    if not st.session_state.get("calc_do"):
+        st.info("Elige SKU y volumen, luego presiona 'Calcular'.")
+        # Evita mostrar resultados hasta que se pulse
+        st.stop() if False else None
+    else:
+        # Consumir trigger y usar valores almacenados
+        st.session_state["calc_do"] = False
+        sku_run = st.session_state.get("calc_sku")
+        vol_run = st.session_state.get("calc_vol")
+        if not sku_run or not vol_run or vol_run <= 0:
+            st.warning("Parámetros inválidos para calcular.")
+        else:
+            with st.spinner("Calculando tablas y precio..."):
+                # Historial (últimos 10 por fecha)
+                d_points2 = points_by_week_for_sku(df, sku_run)
+                d10 = last_10_by_date(d_points2[[c for c in ["semana", "precio_promedio", "kilos", "venta", "costo", "ln_precio_promedio", "ln_kilos"] if c in d_points2.columns]])
+                dsku = d_points2
+
+                with col_left:
+                    st.markdown("Historial (últimos 10 por fecha)")
+                    st.dataframe(d10.reset_index(drop=True), use_container_width=True)
+
+                # Parámetros + estadísticos
