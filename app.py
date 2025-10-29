@@ -1,4 +1,4 @@
-import os
+﻿import os
 import math
 from time import perf_counter
 from typing import List, Optional, Tuple
@@ -7,15 +7,6 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 import matplotlib.pyplot as plt
-try:
-    import altair as alt
-    _ALT_OK = True
-    _ALT_ERR = ""
-except Exception as _e:
-    alt = None  # type: ignore
-    _ALT_OK = False
-    _ALT_ERR = str(_e)
-
 # Seaborn como alternativa prioritaria frente a Matplotlib puro
 try:
     import seaborn as sns
@@ -255,7 +246,7 @@ def zone_summary_for_sku(df: pd.DataFrame, sku: str, start: pd.Timestamp, end: p
     d = d[(d["sku"].astype(str) == str(sku)) & (d["semana"].between(start, end))]
     if d.empty:
         return pd.DataFrame()
-    # Asegura numéricos
+    # Asegura numÃ©ricos
     d["_kilos"] = pd.to_numeric(d.get("kilos"), errors="coerce")
     d["_venta"] = pd.to_numeric(d.get("venta"), errors="coerce") if "venta" in d.columns else np.nan
     d["_costo"] = pd.to_numeric(d.get("costo"), errors="coerce") if "costo" in d.columns else np.nan
@@ -445,7 +436,7 @@ with tab_curvas:
                 ax.legend()
                 st.pyplot(fig, clear_figure=True, use_container_width=False)
 
-                section_header("Datos que alimentan la gráfica")
+                section_header("Datos que alimentan la grÃ¡fica")
                 d_all = d_points.copy()
                 cols_base = [c for c in ["semana", "precio_promedio", "kilos", "venta", "costo", "costo_por_kilo"] if c in d_all.columns]
                 d_view = d_all[cols_base]
@@ -566,13 +557,13 @@ with tab_precio:
                         st.dataframe(style_table(out, ["precio_sugerido", "costo_por_kilo", "contribucion_por_kilo"], ["Q_objetivo"], money_decimals=0, num_decimals=0), use_container_width=True)
 
                 # ----------------------------
-                # Contexto por zona de venta (último mes o rango elegido)
+                # Contexto por zona de venta (Ãºltimo mes o rango elegido)
                 # ----------------------------
                 section_header("Contexto por zona de venta")
                 if "zona_ventas" not in df.columns or "semana" not in df.columns:
                     st.info("No hay columnas 'zona_ventas' y/o 'semana' para generar el resumen.")
                 else:
-                    # Rango por defecto: último mes presente en datos del SKU
+                    # Rango por defecto: Ãºltimo mes presente en datos del SKU
                     try:
                         all_dates = pd.to_datetime(df.loc[df["sku"].astype(str) == str(sku_run), "semana"], errors="coerce")
                         max_date = pd.to_datetime(all_dates.max()) if not all_dates.empty else pd.Timestamp.today()
@@ -598,26 +589,11 @@ with tab_precio:
                         number_cols_zone = [c for c in ["kilos"] if c in zsum.columns]
                         st.dataframe(style_table(zsum, money_cols_zone, number_cols_zone), use_container_width=True)
 
-                        # Visualización: cuadrados por zona (tamaño=kilos, color=precio x kilo)
+                        # VisualizaciÃ³n: cuadrados por zona (tamaÃ±o=kilos, color=precio x kilo)
                         vis_df = zsum.copy()
                         vis_df["kilos"] = pd.to_numeric(vis_df["kilos"], errors="coerce")
                         vis_df["precio_por_kilo"] = pd.to_numeric(vis_df.get("precio_por_kilo"), errors="coerce")
-                        if _ALT_OK and alt is not None and not vis_df.empty and "precio_por_kilo" in vis_df.columns:
-                            color_scale = alt.Scale(domain=[float(vis_df["precio_por_kilo"].min()), float(vis_df["precio_por_kilo"].max())], range=["red", "darkgreen"]) 
-                            chart = (
-                                alt.Chart(vis_df)
-                                .mark_square()
-                                .encode(
-                                    x=alt.X("zona_ventas:N", sort="-y", title="Zona"),
-                                    y=alt.value(0),
-                                    size=alt.Size("kilos:Q", title="Kilos", scale=alt.Scale(type="sqrt", range=[10, 1600])),
-                                    color=alt.Color("precio_por_kilo:Q", title="Precio/kilo", scale=color_scale),
-                                    tooltip=["zona_ventas", alt.Tooltip("kilos:Q", format=",.0f"), alt.Tooltip("precio_por_kilo:Q", format="$,.0f"), alt.Tooltip("costo_por_kilo:Q", format="$,.0f"), alt.Tooltip("contribucion_por_kilo:Q", format="$,.0f")],
-                                )
-                                .properties(height=200, use_container_width=True)
-                            )
-                            st.altair_chart(chart, use_container_width=True)
-                        elif _SNS_OK and sns is not None and not vis_df.empty and "precio_por_kilo" in vis_df.columns:
+                        if _SNS_OK and sns is not None and not vis_df.empty and "precio_por_kilo" in vis_df.columns:
                             try:
                                 import matplotlib.cm as cm
                                 import matplotlib.colors as mcolors
@@ -653,8 +629,6 @@ with tab_precio:
                                 cbar = fig2.colorbar(sm, ax=ax2, pad=0.01)
                                 cbar.set_label("Precio/kilo")
                                 st.pyplot(fig2, clear_figure=True, use_container_width=True)
-                                if not _ALT_OK:
-                                    st.caption(f"Nota: Altair no disponible ({_ALT_ERR}). Usando Seaborn.")
                             except Exception:
                                 st.info("No se pudo renderizar con Seaborn. Usando fallback simple.")
                                 # Fallback Matplotlib: burbuja horizontal por zona
@@ -677,9 +651,9 @@ with tab_precio:
                                     ax3.grid(True, axis='x', alpha=0.2)
                                     st.pyplot(fig3, clear_figure=True, use_container_width=True)
                                 except Exception:
-                                    st.info("No se pudo renderizar la visualización alternativa.")
+                                    st.info("No se pudo renderizar la visualizaciÃ³n alternativa.")
                         else:
-                            # Fallback Matplotlib si no hay Altair ni Seaborn
+                            # Fallback Matplotlib si no hay Seaborn
                             try:
                                 import matplotlib.cm as cm
                                 import matplotlib.colors as mcolors
@@ -698,10 +672,8 @@ with tab_precio:
                                 ax2.set_title("Precio por kilo y volumen por zona (fallback)")
                                 ax2.grid(True, axis='x', alpha=0.2)
                                 st.pyplot(fig2, clear_figure=True, use_container_width=True)
-                                if not _ALT_OK:
-                                    st.caption(f"Nota: Altair no disponible ({_ALT_ERR}). Mostrando gráfico alternativo.")
                             except Exception:
-                                st.info("No se pudo renderizar la visualización alternativa.")
+                                st.info("No se pudo renderizar la visualizaciÃ³n alternativa.")
 
 
 # ----------------------------
@@ -713,7 +685,7 @@ with st.sidebar:
     st.caption("Elasticidades: calculadas en memoria (no se usa CSV precalculado)")
     if st.button("Recalcular elasticidades"):
         compute_elasticidades.clear()
-        st.toast("Recalculando elasticidades…")
+        st.toast("Recalculando elasticidadesâ€¦")
         st.rerun()
     if st.button("Exportar elasticidades a CSV"):
         try:
@@ -794,10 +766,10 @@ with tab_alertas:
             sel3 = st.selectbox("Ver curva del SKU", options=labels3, key="sel_alert")
             sku3 = sel3.split(" - ",1)[0] if sel3 else None
             if st.button("Generar curva del periodo", key="btn_alert_curve") and sku3:
-                # Usar el último rango analizado
+                # Usar el Ãºltimo rango analizado
                 r = st.session_state.get("alert_range", (start3, end3))
                 start_used, end_used = r
-                with st.spinner("Generando gráfica del periodo..."):
+                with st.spinner("Generando grÃ¡fica del periodo..."):
                     pts_all = points_by_week_all(df, start_used, end_used)
                     d_pts3 = pts_all[pts_all["sku"].astype(str) == str(sku3)].copy()
                     a3, b3, r23, n3 = fit_from_points(d_pts3)

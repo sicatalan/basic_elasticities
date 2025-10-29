@@ -1,4 +1,4 @@
-pip>=24
+﻿pip>=24
 setuptools>=70
 wheel>=0.43
 streamlit>=1.35
@@ -6,4 +6,3 @@ pandas>=2.2
 numpy>=1.26
 matplotlib>=3.8
 seaborn>=0.13
-altair>=5.3
