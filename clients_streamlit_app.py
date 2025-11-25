@@ -178,9 +178,17 @@ def summarize_by(df: pd.DataFrame, group_col: str) -> pd.DataFrame:
 
 @st.cache_data(show_spinner=False)
 def compute_adjusted_all_cached(base_df: pd.DataFrame) -> pd.DataFrame:
-    """Calcula el ajuste completo una sola vez para reutilizar en resúmenes y top 50."""
-    adjusted, *_ = compute_adjusted_curve(base_df)
-    return adjusted
+    """Calcula el ajuste por SKU (no mezclado) para reutilizar en resúmenes y top 50."""
+    if base_df.empty or "sku" not in base_df.columns:
+        return base_df
+    adjusted_parts = []
+    for _, grp in base_df.groupby("sku", dropna=False):
+        adjusted_grp, *_ = compute_adjusted_curve(grp)
+        if not adjusted_grp.empty:
+            adjusted_parts.append(adjusted_grp)
+    if adjusted_parts:
+        return pd.concat(adjusted_parts, ignore_index=True)
+    return base_df
 
 
 @st.cache_data(show_spinner=False)
