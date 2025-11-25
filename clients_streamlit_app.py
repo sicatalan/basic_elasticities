@@ -227,7 +227,7 @@ def build_top50_tables(adjusted_df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.Data
 @st.cache_data(show_spinner=False)
 def to_xlsx_bytes(detail_df: pd.DataFrame, cat_df: pd.DataFrame, fam_df: pd.DataFrame) -> bytes:
     buffer = io.BytesIO()
-    with pd.ExcelWriter(buffer) as writer:
+    with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
         detail_df.to_excel(writer, sheet_name="Detalle", index=False)
         if not cat_df.empty:
             cat_df.to_excel(writer, sheet_name="Resumen_categoria", index=False)
@@ -240,7 +240,7 @@ def to_xlsx_bytes(detail_df: pd.DataFrame, cat_df: pd.DataFrame, fam_df: pd.Data
 @st.cache_data(show_spinner=False)
 def to_xlsx_top(detail_df: pd.DataFrame, resumen_df: pd.DataFrame) -> bytes:
     buffer = io.BytesIO()
-    with pd.ExcelWriter(buffer) as writer:
+    with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
         resumen_df.to_excel(writer, sheet_name="Top50_SKU", index=False)
         detail_df.to_excel(writer, sheet_name="Detalle_Top50", index=False)
     buffer.seek(0)

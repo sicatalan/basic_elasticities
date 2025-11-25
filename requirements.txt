@@ -8,3 +8,4 @@ matplotlib>=3.8
 seaborn>=0.13
 typing_extensions>=4.9
 plotly>=5.20
+openpyxl>=3.1
