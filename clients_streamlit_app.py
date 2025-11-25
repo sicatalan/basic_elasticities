@@ -1,3 +1,4 @@
+import io
 import numpy as np
 import pandas as pd
 import streamlit as st
@@ -173,6 +174,77 @@ def summarize_by(df: pd.DataFrame, group_col: str) -> pd.DataFrame:
     )
     grp["delta_margen_pp"] = grp["margen_pct_nuevo"] - grp["margen_pct_actual"]
     return grp
+
+
+@st.cache_data(show_spinner=False)
+def compute_adjusted_all_cached(base_df: pd.DataFrame) -> pd.DataFrame:
+    """Calcula el ajuste completo una sola vez para reutilizar en resúmenes y top 50."""
+    adjusted, *_ = compute_adjusted_curve(base_df)
+    return adjusted
+
+
+@st.cache_data(show_spinner=False)
+def build_cat_fam_summary(df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    cat_summary = summarize_by(df, "categoria")
+    fam_summary = summarize_by(df, "familia")
+    money_cols_cat = ["ingreso_total", "costo_total", "nuevo_ingreso", "delta_ingreso"]
+    pct_cols_cat = ["margen_pct_actual", "margen_pct_nuevo", "delta_margen_pp"]
+    money_cols_fam = ["ingreso_total", "costo_total", "nuevo_ingreso", "delta_ingreso"]
+    pct_cols_fam = ["margen_pct_actual", "margen_pct_nuevo", "delta_margen_pp"]
+    cat_with_total = add_total_row(cat_summary, "categoria", money_cols_cat, pct_cols_cat)
+    fam_with_total = add_total_row(fam_summary, "familia", money_cols_fam, pct_cols_fam)
+    return cat_with_total, fam_with_total
+
+
+@st.cache_data(show_spinner=False)
+def build_top50_tables(adjusted_df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    if adjusted_df.empty:
+        return pd.DataFrame(), pd.DataFrame()
+    sku_summary = adjusted_df.groupby(["sku", "nombre_producto"], as_index=False).agg(
+        kilos_total=("kilos_total", "sum"),
+        ingreso_total=("venta_total", "sum"),
+        costo_total=("costo_total", "sum"),
+        nuevo_ingreso=("nuevo_revenue", "sum"),
+        delta_ingreso=("delta_ingreso", "sum"),
+    )
+    sku_summary["margen_pct_actual"] = np.where(
+        sku_summary["costo_total"] > 0,
+        100 * (sku_summary["ingreso_total"] - sku_summary["costo_total"]) / sku_summary["costo_total"],
+        np.nan,
+    )
+    sku_summary["margen_pct_nuevo"] = np.where(
+        sku_summary["costo_total"] > 0,
+        100 * (sku_summary["nuevo_ingreso"] - sku_summary["costo_total"]) / sku_summary["costo_total"],
+        np.nan,
+    )
+    sku_summary["delta_margen_pp"] = sku_summary["margen_pct_nuevo"] - sku_summary["margen_pct_actual"]
+    sku_top50 = sku_summary.sort_values(["delta_ingreso", "kilos_total"], ascending=False).head(50)
+    sku_set = set(sku_top50["sku"].astype(str))
+    detalle_top = adjusted_df[adjusted_df["sku"].astype(str).isin(sku_set)]
+    return sku_top50, detalle_top
+
+
+@st.cache_data(show_spinner=False)
+def to_xlsx_bytes(detail_df: pd.DataFrame, cat_df: pd.DataFrame, fam_df: pd.DataFrame) -> bytes:
+    buffer = io.BytesIO()
+    with pd.ExcelWriter(buffer) as writer:
+        detail_df.to_excel(writer, sheet_name="Detalle", index=False)
+        if not cat_df.empty:
+            cat_df.to_excel(writer, sheet_name="Resumen_categoria", index=False)
+        if not fam_df.empty:
+            fam_df.to_excel(writer, sheet_name="Resumen_familia", index=False)
+    buffer.seek(0)
+    return buffer.getvalue()
+
+
+@st.cache_data(show_spinner=False)
+def to_xlsx_top(detail_df: pd.DataFrame, resumen_df: pd.DataFrame) -> bytes:
+    buffer = io.BytesIO()
+    with pd.ExcelWriter(buffer) as writer:
+        resumen_df.to_excel(writer, sheet_name="Top50_SKU", index=False)
+        detail_df.to_excel(writer, sheet_name="Detalle_Top50", index=False)
+    buffer.seek(0)
+    return buffer.getvalue()
 
 # -------------------------------------------------------------------
 # Formateo de tablas
@@ -466,99 +538,39 @@ with tab_curve:
 
 with tab_summary:
     st.subheader("Resumenes por categoria y familia")
-    adjusted_all = st.session_state.get("adjusted_all") or agg_base
-    filtered_sum, selected_sku_sum = build_filters(adjusted_all, key_prefix="t3")
+    adjusted_all_state = st.session_state.get("adjusted_all")
+    if not isinstance(adjusted_all_state, pd.DataFrame) or adjusted_all_state.empty:
+        # Se calcula una sola vez y se reutiliza para evitar recomputos al generar XLSX.
+        adjusted_all_state = compute_adjusted_all_cached(agg_base)
+        st.session_state["adjusted_all"] = adjusted_all_state
 
-    def compute_summary_package(df: pd.DataFrame):
-        if df.empty:
-            return None
-        # Asegurar dataframe ajustado
-        if st.session_state.get("adjusted_all") is None or st.session_state.get("adjusted_all").empty:
-            st.session_state["adjusted_all"], _, _, _, _ = compute_adjusted_curve(agg_base)
-        base_adj = st.session_state["adjusted_all"]
-        # Filtrar ajustado con las mismas llaves del filtro actual
-        keys_cols = ["jefe_categoria", "categoria", "familia", "sku", "nombre_producto", "nombre_cliente", "zona_ventas"]
-        keys = df[keys_cols].drop_duplicates()
-        agg_curve_sum = base_adj.merge(keys, on=keys_cols, how="inner")
-        if agg_curve_sum.empty:
-            return None
-        # Resumenes base
-        cat_summary = summarize_by(agg_curve_sum, "categoria")
-        fam_summary = summarize_by(agg_curve_sum, "familia")
-        money_cols_cat = ["ingreso_total", "costo_total", "nuevo_ingreso", "delta_ingreso"]
-        pct_cols_cat = ["margen_pct_actual", "margen_pct_nuevo", "delta_margen_pp"]
-        money_cols_fam = ["ingreso_total", "costo_total", "nuevo_ingreso", "delta_ingreso"]
-        pct_cols_fam = ["margen_pct_actual", "margen_pct_nuevo", "delta_margen_pp"]
-        cat_with_total = add_total_row(cat_summary, "categoria", money_cols_cat, pct_cols_cat)
-        fam_with_total = add_total_row(fam_summary, "familia", money_cols_fam, pct_cols_fam)
-
-        # Top 50 SKUs
-        sku_summary = agg_curve_sum.groupby(["sku", "nombre_producto"], as_index=False).agg(
-            kilos_total=("kilos_total", "sum"),
-            ingreso_total=("venta_total", "sum"),
-            costo_total=("costo_total", "sum"),
-            nuevo_ingreso=("nuevo_revenue", "sum"),
-            delta_ingreso=("delta_ingreso", "sum"),
-        )
-        sku_summary["margen_pct_actual"] = np.where(
-            sku_summary["costo_total"] > 0,
-            100 * (sku_summary["ingreso_total"] - sku_summary["costo_total"]) / sku_summary["costo_total"],
-            np.nan,
-        )
-        sku_summary["margen_pct_nuevo"] = np.where(
-            sku_summary["costo_total"] > 0,
-            100 * (sku_summary["nuevo_ingreso"] - sku_summary["costo_total"]) / sku_summary["costo_total"],
-            np.nan,
-        )
-        sku_summary["delta_margen_pp"] = sku_summary["margen_pct_nuevo"] - sku_summary["margen_pct_actual"]
-        sku_top50 = sku_summary.sort_values(["delta_ingreso", "kilos_total"], ascending=False).head(50)
-        sku_set = set(sku_top50["sku"].astype(str))
-        detalle_top = agg_curve_sum[agg_curve_sum["sku"].astype(str).isin(sku_set)]
-
-        import io
-
-        def to_xlsx_bytes(detail_df: pd.DataFrame, cat_df: pd.DataFrame, fam_df: pd.DataFrame) -> bytes:
-            buffer = io.BytesIO()
-            with pd.ExcelWriter(buffer) as writer:
-                detail_df.to_excel(writer, sheet_name="Detalle", index=False)
-                if not cat_df.empty:
-                    cat_df.to_excel(writer, sheet_name="Resumen_categoria", index=False)
-                if not fam_df.empty:
-                    fam_df.to_excel(writer, sheet_name="Resumen_familia", index=False)
-            buffer.seek(0)
-            return buffer.getvalue()
-
-        def to_xlsx_top(detail_df: pd.DataFrame, resumen_df: pd.DataFrame) -> bytes:
-            buffer = io.BytesIO()
-            with pd.ExcelWriter(buffer) as writer:
-                resumen_df.to_excel(writer, sheet_name="Top50_SKU", index=False)
-                detail_df.to_excel(writer, sheet_name="Detalle_Top50", index=False)
-            buffer.seek(0)
-            return buffer.getvalue()
-
-        pkg = {
-            "agg_curve_sum": agg_curve_sum,
-            "cat": cat_with_total,
-            "fam": fam_with_total,
-            "sku_top": sku_top50,
-            "xlsx": to_xlsx_bytes(df, cat_summary, fam_summary),
-            "xlsx_top": to_xlsx_top(detalle_top, sku_top50),
-        }
-        return pkg
+    adjusted_all = adjusted_all_state
+    filtered_sum, _ = build_filters(adjusted_all, key_prefix="t3")
 
     if st.button("Calcular resúmenes", key="btn_summary"):
         with st.spinner("Calculando resúmenes..."):
-            st.session_state["summary_pkg"] = compute_summary_package(filtered_sum)
+            if adjusted_all.empty:
+                st.session_state["summary_pkg"] = None
+            else:
+                cat_with_total, fam_with_total = build_cat_fam_summary(filtered_sum)
+                sku_top50, detalle_top = build_top50_tables(adjusted_all)
+
+                summary_pkg = {
+                    "cat": cat_with_total,
+                    "fam": fam_with_total,
+                    "sku_top": sku_top50,
+                    "xlsx": to_xlsx_bytes(filtered_sum if not filtered_sum.empty else adjusted_all, cat_with_total, fam_with_total),
+                    "xlsx_top": to_xlsx_top(detalle_top, sku_top50),
+                }
+                st.session_state["summary_pkg"] = summary_pkg
 
     pkg = st.session_state.get("summary_pkg")
     if pkg is None:
         st.info("Presiona 'Calcular resúmenes' para generar la vista.")
-    elif pkg is False or (isinstance(pkg, dict) and pkg.get("agg_curve_sum") is not None and pkg["agg_curve_sum"].empty):
-        st.info("No hay datos con los filtros actuales.")
     else:
-        cat_with_total = pkg["cat"]
-        fam_with_total = pkg["fam"]
-        sku_top50 = pkg["sku_top"]
+        cat_with_total = pkg.get("cat", pd.DataFrame())
+        fam_with_total = pkg.get("fam", pd.DataFrame())
+        sku_top50 = pkg.get("sku_top", pd.DataFrame())
 
         if not cat_with_total.empty:
             money_cols_cat = ["ingreso_total", "costo_total", "nuevo_ingreso", "delta_ingreso"]
@@ -583,7 +595,7 @@ with tab_summary:
         if not sku_top50.empty:
             money_cols_sku = ["ingreso_total", "costo_total", "nuevo_ingreso", "delta_ingreso"]
             pct_cols_sku = ["margen_pct_actual", "margen_pct_nuevo", "delta_margen_pp"]
-            st.markdown("**Top 50 SKUs por impacto (delta ingreso y volumen)**")
+            st.markdown("**Top 50 SKUs por impacto (sin filtros, para seguimiento)**")
             st.dataframe(format_display_table(sku_top50, money_cols_sku, pct_cols_sku), use_container_width=True)
             if isinstance(pkg.get("xlsx_top"), (bytes, bytearray)) and len(pkg["xlsx_top"]) > 0:
                 st.download_button(
