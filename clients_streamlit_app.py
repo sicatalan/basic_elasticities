@@ -25,6 +25,22 @@ def get_aggregated(df: pd.DataFrame) -> pd.DataFrame:
     return aggregate_by_client(df)
 
 
+def add_client_key(df: pd.DataFrame) -> pd.DataFrame:
+    """Agrega columna 'cliente' usando nombre_holding si está presente/no vacío, sino nombre_cliente."""
+    work = df.copy()
+    holding = work.get("nombre_holding")
+    base_name = work.get("nombre_cliente")
+    if holding is None and base_name is None:
+        work["cliente"] = ""
+        return work
+    holding_clean = (
+        holding.fillna("").astype(str).str.strip() if holding is not None else pd.Series([""] * len(work), index=work.index)
+    )
+    base_clean = base_name.fillna("").astype(str).str.strip() if base_name is not None else pd.Series([""] * len(work), index=work.index)
+    work["cliente"] = np.where(holding_clean != "", holding_clean, base_clean)
+    return work
+
+
 def add_price_columns(df: pd.DataFrame) -> pd.DataFrame:
     work = df.copy()
     work["precio_por_kilo"] = np.where(
@@ -40,8 +56,8 @@ def add_price_columns(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def aggregate_by_client(df: pd.DataFrame) -> pd.DataFrame:
-    base = add_price_columns(df)
-    group_cols = ["jefe_categoria", "categoria", "familia", "sku", "nombre_producto", "nombre_cliente", "zona_ventas"]
+    base = add_price_columns(add_client_key(df))
+    group_cols = ["jefe_categoria", "categoria", "familia", "sku", "nombre_producto", "cliente", "nombre_holding", "zona_ventas"]
     agg = (
         base.groupby(group_cols, as_index=False)
         .agg(
@@ -123,18 +139,17 @@ def predict_theoretical_price(vol_sorted: np.ndarray, price_sorted: np.ndarray, 
 # -------------------------------------------------------------------
 # Ajustes y resúmenes
 # -------------------------------------------------------------------
-def compute_adjusted_curve(df_filtered: pd.DataFrame) -> Tuple[pd.DataFrame, np.ndarray, np.ndarray, float, float]:
+def compute_adjusted_curve(df_filtered: pd.DataFrame, reference_df: Optional[pd.DataFrame] = None) -> Tuple[pd.DataFrame, np.ndarray, np.ndarray, float, float]:
+    """Calcula curva teórica y ajustes. Si se pasa reference_df, la curva se calcula con todo ese universo, pero se aplica a df_filtered."""
     if df_filtered.empty:
         return df_filtered, np.array([]), np.array([]), np.nan, np.nan
-    # Trabajar sobre copia mínima
     work = df_filtered.copy()
-    clean_df, (p5, p95) = winsorize_and_filter(work, price_col="precio_real")
+    ref = reference_df if reference_df is not None and not reference_df.empty else work
+    clean_df, (p5, p95) = winsorize_and_filter(ref, price_col="precio_real")
     vol_sorted, price_sorted = monotonic_curve(
         clean_df["kilos_total"].to_numpy(float), clean_df["precio_limpio"].to_numpy(float)
     )
-    work["precio_teorico"] = predict_theoretical_price(
-        vol_sorted, price_sorted, work["kilos_total"].to_numpy(float)
-    )
+    work["precio_teorico"] = predict_theoretical_price(vol_sorted, price_sorted, work["kilos_total"].to_numpy(float))
     work["nuevo_precio"] = np.where(
         work["precio_real"] < work["precio_teorico"], work["precio_teorico"], work["precio_real"]
     )
@@ -183,7 +198,7 @@ def compute_adjusted_all_cached(base_df: pd.DataFrame) -> pd.DataFrame:
         return base_df
     adjusted_parts = []
     for _, grp in base_df.groupby("sku", dropna=False):
-        adjusted_grp, *_ = compute_adjusted_curve(grp)
+        adjusted_grp, *_ = compute_adjusted_curve(grp, reference_df=grp)
         if not adjusted_grp.empty:
             adjusted_parts.append(adjusted_grp)
     if adjusted_parts:
@@ -303,6 +318,11 @@ def build_filters(df: pd.DataFrame, key_prefix: str = "") -> Tuple[pd.DataFrame,
         sel_chief = st.selectbox("Jefe de categoria", options=chiefs, key=f"{key_prefix}_chief")
         filtered = filtered if sel_chief == "Todos" else filtered[filtered["jefe_categoria"] == sel_chief]
 
+    if "zona_ventas" in filtered.columns:
+        zonas = ["Todas"] + sorted(filtered["zona_ventas"].dropna().unique().tolist())
+        sel_zona = st.selectbox("Zona de ventas", options=zonas, key=f"{key_prefix}_zona")
+        filtered = filtered if sel_zona == "Todas" else filtered[filtered["zona_ventas"] == sel_zona]
+
     cats = ["Todas"] + sorted(filtered["categoria"].dropna().unique().tolist())
     sel_cat = st.selectbox("Categoría", options=cats, key=f"{key_prefix}_cat")
     filtered = filtered if sel_cat == "Todas" else filtered[filtered["categoria"] == sel_cat]
@@ -325,7 +345,7 @@ def build_filters(df: pd.DataFrame, key_prefix: str = "") -> Tuple[pd.DataFrame,
 
 def render_scatter(df_plot: pd.DataFrame, x_col: str, y_col: str, title: str, x_label: str, y_label: str) -> None:
     hover_fields = {
-        "nombre_cliente": True,
+        "cliente": True,
         "zona_ventas": True,
         "sku": True,
         "nombre_producto": True,
@@ -389,7 +409,8 @@ with tab_data:
         "familia",
         "sku",
         "nombre_producto",
-        "nombre_cliente",
+        "cliente",
+        "nombre_holding",
         "zona_ventas",
         "kilos_total",
         "venta_total",
@@ -422,7 +443,8 @@ with tab_curve:
     if not selected_sku:
         st.info("Selecciona un SKU para construir la curva teórica.")
     else:
-        agg_curve, vol_sorted, price_sorted, p5, p95 = compute_adjusted_curve(filtered_curve)
+        sku_universe = agg_base[agg_base["sku"] == selected_sku]
+        agg_curve, vol_sorted, price_sorted, p5, p95 = compute_adjusted_curve(filtered_curve, reference_df=sku_universe)
         if agg_curve.empty:
             st.info("No hay datos para el SKU seleccionado.")
         else:
@@ -436,7 +458,7 @@ with tab_curve:
             # Gráfico con curva y marcadores especiales para clientes bajo la curva.
             chart_df = agg_curve.rename(columns={"kilos_total": "kilos_plot", "precio_real": "precio_plot"})
             hover_fields_curve = {
-                "nombre_cliente": True,
+                "cliente": True,
                 "zona_ventas": True,
                 "sku": True,
                 "nombre_producto": True,
@@ -508,7 +530,8 @@ with tab_curve:
             st.markdown("**Detalle por cliente**")
             detail_cols = [
                 "jefe_categoria",
-                "nombre_cliente",
+                "cliente",
+                "nombre_holding",
                 "zona_ventas",
                 "categoria",
                 "familia",
@@ -561,7 +584,7 @@ with tab_summary:
                 st.session_state["summary_pkg"] = None
             else:
                 cat_with_total, fam_with_total = build_cat_fam_summary(filtered_sum)
-                sku_top50, detalle_top = build_top50_tables(adjusted_all)
+                sku_top50, detalle_top = build_top50_tables(filtered_sum)
 
                 summary_pkg = {
                     "cat": cat_with_total,
