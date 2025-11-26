@@ -269,6 +269,164 @@ def to_xlsx_top(detail_df: pd.DataFrame, resumen_df: pd.DataFrame) -> bytes:
     buffer.seek(0)
     return buffer.getvalue()
 
+
+def select_experiment_skus(df: pd.DataFrame, max_total: int = 6, min_clientes: int = 10) -> List[str]:
+    """Elige SKUs sugeridos: 2 alto volumen, 2 alta variabilidad de margen, 2 alto potencial (delta_margen); exige mínimo de clientes y excluye categoría no deseada."""
+    if df.empty or "sku" not in df.columns:
+        return []
+    df_use = df[df.get("categoria") != "CAFE Y BEBIDAS CALIENTES"] if "categoria" in df.columns else df
+    metrics = (
+        df_use.groupby(["sku", "nombre_producto"], as_index=False)
+        .agg(
+            kilos_total=("kilos_total", "sum"),
+            delta_margen=("delta_margen", "sum"),
+            delta_ingreso=("delta_ingreso", "sum"),
+            margen_pct_actual_std=("margen_pct_actual", "std"),
+            clientes=("cliente", "nunique"),
+        )
+        .fillna({"margen_pct_actual_std": 0})
+    )
+    metrics = metrics[(metrics["clientes"] >= min_clientes) & (metrics["delta_ingreso"] >= 200000)]
+    if metrics.empty:
+        return []
+    picks: List[str] = []
+    def add_top(series: pd.Series):
+        for sku in series:
+            sku_str = str(sku)
+            if sku_str not in picks and len(picks) < max_total:
+                picks.append(sku_str)
+
+    add_top(metrics.sort_values("kilos_total", ascending=False)["sku"].head(2))
+    add_top(metrics.sort_values("margen_pct_actual_std", ascending=False)["sku"].head(2))
+    add_top(metrics.sort_values("delta_margen", ascending=False)["sku"].head(2))
+    if len(picks) < max_total:
+        add_top(metrics.sort_values("delta_margen", ascending=False)["sku"])
+    return picks[:max_total]
+
+
+def assign_experiment_groups(df: pd.DataFrame) -> pd.DataFrame:
+    """Segmenta por volumen y gap vs curva, y asigna grupos A-E."""
+    if df.empty:
+        return df
+    work = df.copy()
+    gap = np.maximum(work["precio_teorico"] - work["precio_real"], 0)
+    work["gap_teorico"] = gap
+    vol_p75 = np.nanpercentile(work["kilos_total"], 75) if work["kilos_total"].notna().any() else 0
+    vol_p40 = np.nanpercentile(work["kilos_total"], 40) if work["kilos_total"].notna().any() else 0
+    def volume_seg(val: float) -> str:
+        if np.isnan(val):
+            return "Sin_dato"
+        if val >= vol_p75:
+            return "High_volume"
+        if val >= vol_p40:
+            return "Mid_volume"
+        return "Low_volume"
+    work["segmento_volumen"] = work["kilos_total"].apply(volume_seg)
+
+    gaps_pos = gap[gap > 0].dropna()
+    if gaps_pos.empty:
+        t1 = t2 = t3 = 0
+    else:
+        t1, t2, t3 = np.percentile(gaps_pos, [33, 66, 90])
+
+    def gap_seg(val: float) -> str:
+        if val <= 0:
+            return "Sin_gap"
+        if val <= t1:
+            return "Gap_leve"
+        if val <= t2:
+            return "Gap_medio"
+        if val <= t3:
+            return "Gap_alto"
+        return "Gap_extremo"
+
+    work["segmento_gap"] = work["gap_teorico"].apply(gap_seg)
+
+    def group_assign(val: float) -> str:
+        if val <= 0:
+            return "A_Control"
+        if val <= t1:
+            return "B_Subida_30"
+        if val <= t2:
+            return "C_Subida_50"
+        if val <= t3:
+            return "D_Subida_70"
+        return "E_Normalizacion"
+
+    work["grupo_experimento"] = work["gap_teorico"].apply(group_assign)
+    # Asegurar control en parte de los clientes bajo curva (10% sample para comparar)
+    under_curve_idx = work.index[work["gap_teorico"] > 0].tolist()
+    if under_curve_idx:
+        sample_size = max(1, int(0.1 * len(under_curve_idx)))
+        sample_control = np.random.choice(under_curve_idx, size=sample_size, replace=False)
+        work.loc[sample_control, "grupo_experimento"] = "A_Control"
+        work.loc[sample_control, "factor_incremento"] = 0.0
+    factor_map = {
+        "A_Control": 0.0,
+        "B_Subida_30": 0.3,
+        "C_Subida_50": 0.5,
+        "D_Subida_70": 0.7,
+        "E_Normalizacion": 1.0,
+    }
+    work["factor_incremento"] = work["grupo_experimento"].map(factor_map).fillna(0.0)
+    work["precio_experimental"] = work["precio_real"]
+    mask_gap = work["gap_teorico"] > 0
+    work.loc[mask_gap, "precio_experimental"] = np.minimum(
+        work.loc[mask_gap, "precio_real"] + work.loc[mask_gap, "factor_incremento"] * work.loc[mask_gap, "gap_teorico"],
+        work.loc[mask_gap, "precio_teorico"],
+    )
+    work["revenue_experimental"] = np.where(
+        mask_gap,
+        work["precio_experimental"] * work["kilos_total"],
+        work["venta_total"],
+    )
+    work["delta_ingreso_exp"] = work["revenue_experimental"] - work["venta_total"]
+    work["margen_exp"] = np.where(mask_gap, work["revenue_experimental"] - work["costo_total"], work["margen_actual"])
+    work["delta_margen_exp"] = work["margen_exp"] - work["margen_actual"]
+    return work
+
+
+def build_experiment_plan(df: pd.DataFrame, sku_list: List[str]) -> Tuple[pd.DataFrame, pd.DataFrame, bytes]:
+    if df.empty or not sku_list:
+        return pd.DataFrame(), pd.DataFrame(), b""
+    detail_parts = []
+    for sku in sku_list:
+        subset = df[df["sku"].astype(str) == str(sku)]
+        if subset.empty:
+            continue
+        detail_parts.append(assign_experiment_groups(subset))
+    if not detail_parts:
+        return pd.DataFrame(), pd.DataFrame(), b""
+    detail = pd.concat(detail_parts, ignore_index=True)
+    # Excluir SKUs sin clientes en tratamiento (todos control)
+    treated = detail.groupby("sku")["grupo_experimento"].apply(lambda s: (s != "A_Control").sum()).reset_index()
+    treated_ok = set(treated[treated["grupo_experimento"] > 0]["sku"].astype(str))
+    detail = detail[detail["sku"].astype(str).isin(treated_ok)]
+    if detail.empty:
+        return pd.DataFrame(), pd.DataFrame(), b""
+    summary = detail.groupby(["sku", "nombre_producto"], as_index=False).agg(
+        clientes_total=("cliente", "nunique"),
+        clientes_gap=("gap_teorico", lambda s: (s > 0).sum()),
+        kilos_total=("kilos_total", "sum"),
+        gap_total=("gap_teorico", "sum"),
+        delta_ingreso_exp=("delta_ingreso_exp", "sum"),
+        delta_margen_exp=("delta_margen_exp", "sum"),
+    )
+    exp_counts = detail.pivot_table(index=["sku", "nombre_producto"], columns="grupo_experimento", values="cliente", aggfunc="nunique", fill_value=0)
+    exp_counts = exp_counts.reset_index()
+    summary = summary.merge(exp_counts, on=["sku", "nombre_producto"], how="left")
+
+    def to_xlsx_experiments(resumen_df: pd.DataFrame, detail_df: pd.DataFrame) -> bytes:
+        buffer = io.BytesIO()
+        with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
+            resumen_df.to_excel(writer, sheet_name="SKUs_experimentos", index=False)
+            detail_df.to_excel(writer, sheet_name="Detalle_experimentos", index=False)
+        buffer.seek(0)
+        return buffer.getvalue()
+
+    xlsx = to_xlsx_experiments(summary, detail)
+    return summary, detail, xlsx
+
 # -------------------------------------------------------------------
 # Formateo de tablas
 # -------------------------------------------------------------------
@@ -578,6 +736,19 @@ with tab_summary:
     adjusted_all = adjusted_all_state
     filtered_sum, _ = build_filters(adjusted_all, key_prefix="t3")
 
+    # Invalidar paquetes de resumen/experimentos si cambian los filtros principales
+    filter_signature = (
+        st.session_state.get("t3_chief"),
+        st.session_state.get("t3_zona"),
+        st.session_state.get("t3_cat"),
+        st.session_state.get("t3_fam"),
+        st.session_state.get("t3_sku"),
+    )
+    if st.session_state.get("summary_sig") != filter_signature:
+        st.session_state["summary_sig"] = filter_signature
+        st.session_state.pop("summary_pkg", None)
+        st.session_state.pop("exp_pkg", None)
+
     if st.button("Calcular resúmenes", key="btn_summary"):
         with st.spinner("Calculando resúmenes..."):
             if adjusted_all.empty:
@@ -633,5 +804,37 @@ with tab_summary:
                     "Descargar Top 50 (XLSX)",
                     data=pkg["xlsx_top"],
                     file_name="top50_sku_impacto.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                )
+
+        # Plan de experimentos basado en clientes filtrados (curva global por SKU)
+        st.markdown("**Plan de experimentos (curva global, clientes filtrados)**")
+        eligible_skus_df = (
+            filtered_sum.groupby("sku", as_index=False)
+            .agg(clientes=("cliente", "nunique"))
+        )
+        eligible_skus = set(eligible_skus_df[eligible_skus_df["clientes"] >= 10]["sku"].astype(str).tolist())
+        available_skus = sorted(eligible_skus) if not filtered_sum.empty else []
+        default_exp_skus = [s for s in select_experiment_skus(filtered_sum) if s in available_skus][:6]
+        exp_skus = st.multiselect(
+            "Selecciona hasta 6 SKUs (preselección sugerida: volumen, variabilidad, potencial margen)",
+            options=available_skus,
+            default=default_exp_skus,
+            max_selections=6,
+            key="exp_skus",
+        )
+        if st.button("Preparar experimentos", key="btn_exp"):
+            with st.spinner("Armando combinaciones de experimentos..."):
+                resumen_exp, detalle_exp, xlsx_exp = build_experiment_plan(filtered_sum, exp_skus)
+                st.session_state["exp_pkg"] = {"resumen": resumen_exp, "detalle": detalle_exp, "xlsx": xlsx_exp}
+
+        exp_pkg = st.session_state.get("exp_pkg")
+        if exp_pkg and isinstance(exp_pkg.get("resumen"), pd.DataFrame) and not exp_pkg["resumen"].empty:
+            st.dataframe(exp_pkg["resumen"], use_container_width=True)
+            if isinstance(exp_pkg.get("xlsx"), (bytes, bytearray)) and len(exp_pkg["xlsx"]) > 0:
+                st.download_button(
+                    "Descargar experimentos (XLSX)",
+                    data=exp_pkg["xlsx"],
+                    file_name="experimentos_sku.xlsx",
                     mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                 )
