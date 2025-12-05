@@ -37,7 +37,8 @@ def add_client_key(df: pd.DataFrame) -> pd.DataFrame:
         holding.fillna("").astype(str).str.strip() if holding is not None else pd.Series([""] * len(work), index=work.index)
     )
     base_clean = base_name.fillna("").astype(str).str.strip() if base_name is not None else pd.Series([""] * len(work), index=work.index)
-    work["cliente"] = np.where(holding_clean != "", holding_clean, base_clean)
+    # Si holding es vacío o "RESTO", se usa el nombre de cliente como identificador.
+    work["cliente"] = np.where((holding_clean != "") & (holding_clean.str.upper() != "RESTO"), holding_clean, base_clean)
     return work
 
 
@@ -270,11 +271,12 @@ def to_xlsx_top(detail_df: pd.DataFrame, resumen_df: pd.DataFrame) -> bytes:
     return buffer.getvalue()
 
 
-def select_experiment_skus(df: pd.DataFrame, max_total: int = 6, min_clientes: int = 10) -> List[str]:
+def select_experiment_skus(df: pd.DataFrame, max_total: int = 6, min_clientes: int = 50) -> List[str]:
     """Elige SKUs sugeridos: 2 alto volumen, 2 alta variabilidad de margen, 2 alto potencial (delta_margen); exige mínimo de clientes y excluye categoría no deseada."""
     if df.empty or "sku" not in df.columns:
         return []
-    df_use = df[df.get("categoria") != "CAFE Y BEBIDAS CALIENTES"] if "categoria" in df.columns else df
+    excluded_cats = {"CAFE Y BEBIDAS CALIENTES", "CARNES", "HIGIENE Y LIMPIEZA"}
+    df_use = df[~df.get("categoria").isin(excluded_cats)] if "categoria" in df.columns else df
     metrics = (
         df_use.groupby(["sku", "nombre_producto"], as_index=False)
         .agg(
@@ -813,7 +815,7 @@ with tab_summary:
             filtered_sum.groupby("sku", as_index=False)
             .agg(clientes=("cliente", "nunique"))
         )
-        eligible_skus = set(eligible_skus_df[eligible_skus_df["clientes"] >= 10]["sku"].astype(str).tolist())
+        eligible_skus = set(eligible_skus_df[eligible_skus_df["clientes"] >= 50]["sku"].astype(str).tolist())
         available_skus = sorted(eligible_skus) if not filtered_sum.empty else []
         default_exp_skus = [s for s in select_experiment_skus(filtered_sum) if s in available_skus][:6]
         exp_skus = st.multiselect(
