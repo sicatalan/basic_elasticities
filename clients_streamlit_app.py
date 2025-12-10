@@ -69,6 +69,7 @@ def aggregate_by_client(df: pd.DataFrame) -> pd.DataFrame:
             precio_por_kilo_medio=("precio_por_kilo", "mean"),
             costo_por_kilo_medio=("costo_por_kilo", "mean"),
             n_movimientos=("kilos", "count"),
+            frecuencia_total=("frecuencia", "sum") if "frecuencia" in base.columns else ("kilos", "count"),
         )
     )
     agg["precio_real"] = np.where(agg["kilos_total"] > 0, agg["venta_total"] / agg["kilos_total"], np.nan)
@@ -700,6 +701,7 @@ with tab_curve:
                 "kilos_total",
                 "venta_total",
                 "costo_total",
+                "frecuencia_total",
                 "precio_real",
                 "precio_teorico",
                 "nuevo_precio",
